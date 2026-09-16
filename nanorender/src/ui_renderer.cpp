@@ -2,6 +2,7 @@
 // microui.h included via ui_renderer.h
 #include <string.h>
 #include <algorithm>
+#include <math.h>
 
 // Minimal 8x8 bitmap font for ASCII characters 32-126
 // Each byte represents a row of 8 pixels
@@ -103,11 +104,14 @@ static const uint8_t font_8x8[95][8] = {
     {0x00, 0x00, 0x00, 0x76, 0xdc, 0x00, 0x00, 0x00}, // ~
 };
 
-UIRenderer::UIRenderer(int width, int height) : m_width(width), m_height(height), m_buffer(nullptr) {
+UIRenderer::UIRenderer(int width, int height)
+    : m_width(width), m_height(height), m_buffer(nullptr)
+{
     m_clip_rect = {0, 0, width, height};
 }
 
-void UIRenderer::render(mu_Context* ctx, uint32_t* buffer) {
+void UIRenderer::render(mu_Context* ctx, uint32_t* buffer)
+{
     m_buffer = buffer;
     mu_Command* cmd = NULL;
     while (mu_next_command(ctx, &cmd)) {
@@ -120,21 +124,48 @@ void UIRenderer::render(mu_Context* ctx, uint32_t* buffer) {
     }
 }
 
-void UIRenderer::draw_rect(mu_Rect rect, mu_Color color) {
+// ---------------------------------------------------------------------------
+// Part 4: Wave visual offset
+//
+// We apply a horizontal sine-wave displacement to every pixel we write in
+// draw_rect.  The wave shifts each row by  offset_x = sin(y * 0.05) * 6
+// pixels to the right before writing into m_buffer.
+//
+// WHY CLICKING THE VISUALLY-SHIFTED BUTTON FAILS:
+//   MicroUI tracks the logical (unshifted) rectangle of each widget to decide
+//   whether a mouse click falls inside it.  The hit-test runs on the original
+//   coordinates stored in mu_Context – it has no knowledge of the pixel offset
+//   we apply here in the renderer.  So the visual button appears shifted
+//   ~6 px to the right on screen, but the clickable region is still at its
+//   original position.  To successfully click the button you must click at the
+//   ORIGINAL (non-shifted) screen position – i.e., roughly 6 px to the LEFT
+//   of where the button visually appears.
+// ---------------------------------------------------------------------------
+void UIRenderer::draw_rect(mu_Rect rect, mu_Color color)
+{
     uint32_t c = to_uint32(color);
+
     int x1 = std::max({rect.x, m_clip_rect.x, 0});
     int y1 = std::max({rect.y, m_clip_rect.y, 0});
     int x2 = std::min({rect.x + rect.w, m_clip_rect.x + m_clip_rect.w, m_width});
     int y2 = std::min({rect.y + rect.h, m_clip_rect.y + m_clip_rect.h, m_height});
 
     for (int y = y1; y < y2; y++) {
+        // Part 4: per-row horizontal wave offset
+        int wave_offset = (int)(sinf(y * 0.05f) * 6.0f);
+
         for (int x = x1; x < x2; x++) {
-            m_buffer[y * m_width + x] = c;
+            int px = x + wave_offset;   // apply visual shift
+            // bounds-check the shifted destination
+            if (px < 0 || px >= m_width) continue;
+            if (y  < 0 || y  >= m_height) continue;
+            m_buffer[y * m_width + px] = c;
         }
     }
 }
 
-void UIRenderer::draw_text(const char* text, mu_Vec2 pos, mu_Color color) {
+void UIRenderer::draw_text(const char* text, mu_Vec2 pos, mu_Color color)
+{
     uint32_t c = to_uint32(color);
     int x = pos.x;
     int y = pos.y;
@@ -142,9 +173,11 @@ void UIRenderer::draw_text(const char* text, mu_Vec2 pos, mu_Color color) {
         if (*p < 32 || *p > 126) continue;
         const uint8_t* glyph = font_8x8[*p - 32];
         for (int row = 0; row < 8; row++) {
+            // Part 4: apply same wave offset to text so it matches rect shift
+            int wave_offset = (int)(sinf((y + row) * 0.05f) * 6.0f);
             for (int col = 0; col < 8; col++) {
                 if (glyph[row] & (0x80 >> col)) {
-                    int px = x + col;
+                    int px = x + col + wave_offset;
                     int py = y + row;
                     if (px >= m_clip_rect.x && px < m_clip_rect.x + m_clip_rect.w &&
                         py >= m_clip_rect.y && py < m_clip_rect.y + m_clip_rect.h &&
@@ -158,17 +191,19 @@ void UIRenderer::draw_text(const char* text, mu_Vec2 pos, mu_Color color) {
     }
 }
 
-void UIRenderer::draw_pixel(int x, int y, uint32_t c) {
+void UIRenderer::draw_pixel(int x, int y, uint32_t c)
+{
     if (x < m_clip_rect.x || x >= m_clip_rect.x + m_clip_rect.w) return;
     if (y < m_clip_rect.y || y >= m_clip_rect.y + m_clip_rect.h) return;
     if (x < 0 || x >= m_width || y < 0 || y >= m_height) return;
     m_buffer[y * m_width + x] = c;
 }
 
-void UIRenderer::draw_line(int x0, int y0, int x1, int y1, uint32_t c) {
-    // Bresenham's line algorithm
-    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
-    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+void UIRenderer::draw_line(int x0, int y0, int x1, int y1, uint32_t c)
+{
+    // Bresenham's – handles all 8 octants without code duplication (DRY)
+    int dx =  abs(x1 - x0), sx = (x0 < x1) ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = (y0 < y1) ? 1 : -1;
     int err = dx + dy;
     while (true) {
         draw_pixel(x0, y0, c);
@@ -179,9 +214,9 @@ void UIRenderer::draw_line(int x0, int y0, int x1, int y1, uint32_t c) {
     }
 }
 
-void UIRenderer::draw_icon(int id, mu_Rect rect, mu_Color color) {
+void UIRenderer::draw_icon(int id, mu_Rect rect, mu_Color color)
+{
     uint32_t c = to_uint32(color);
-    // Centre a square drawing area within the rect (max 14x14)
     int sz = std::min({rect.w, rect.h, 14});
     int cx = rect.x + rect.w / 2;
     int cy = rect.y + rect.h / 2;
@@ -189,7 +224,6 @@ void UIRenderer::draw_icon(int id, mu_Rect rect, mu_Color color) {
 
     switch (id) {
         case MU_ICON_CLOSE: {
-            // X: two diagonal lines with 2px thickness
             for (int t = -1; t <= 1; t++) {
                 draw_line(cx - h, cy - h + t, cx + h, cy + h + t, c);
                 draw_line(cx + h, cy - h + t, cx - h, cy + h + t, c);
@@ -197,17 +231,14 @@ void UIRenderer::draw_icon(int id, mu_Rect rect, mu_Color color) {
             break;
         }
         case MU_ICON_CHECK: {
-            // Checkmark: short upstroke then long upstroke
-            int lx = cx - h + 1;
-            int ly = cy + 1;
+            int lx = cx - h + 1, ly = cy + 1;
             for (int t = -1; t <= 1; t++) {
-                draw_line(lx,      ly + t, lx + h/2, cy + h/2 + t, c);
-                draw_line(lx + h/2, cy + h/2 + t, cx + h, cy - h + t, c);
+                draw_line(lx,        ly + t,          lx + h/2, cy + h/2 + t, c);
+                draw_line(lx + h/2, cy + h/2 + t,    cx + h,   cy - h + t,   c);
             }
             break;
         }
         case MU_ICON_COLLAPSED: {
-            // Right-pointing filled triangle: base on left, tip on right
             for (int dx = -h; dx <= h; dx++) {
                 int hh = (h - dx) / 2;
                 draw_line(cx + dx, cy - hh, cx + dx, cy + hh, c);
@@ -215,7 +246,6 @@ void UIRenderer::draw_icon(int id, mu_Rect rect, mu_Color color) {
             break;
         }
         case MU_ICON_EXPANDED: {
-            // Down-pointing filled triangle: base on top, tip on bottom
             for (int dy = -h; dy <= h; dy++) {
                 int hw = (h - dy) / 2;
                 draw_line(cx - hw, cy + dy, cx + hw, cy + dy, c);
@@ -228,6 +258,7 @@ void UIRenderer::draw_icon(int id, mu_Rect rect, mu_Color color) {
     }
 }
 
-void UIRenderer::set_clip_rect(mu_Rect rect) {
+void UIRenderer::set_clip_rect(mu_Rect rect)
+{
     m_clip_rect = rect;
 }

@@ -30,6 +30,15 @@ FetchContent_MakeAvailable(microui)
 add_library(microui_lib STATIC ${microui_SOURCE_DIR}/src/microui.c)
 target_include_directories(microui_lib PUBLIC ${microui_SOURCE_DIR}/src)
 
+# --- GLM (header-only math library) ---
+FetchContent_Declare(
+    glm
+    GIT_REPOSITORY https://github.com/g-truc/glm.git
+    GIT_TAG        0.9.9.8
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(glm)
+
 # --- Our application ---
 add_executable(minigui
     src/main.cpp
@@ -38,6 +47,6 @@ add_executable(minigui
     src/ui_bridge.h
 )
 
-target_link_libraries(minigui PRIVATE microui_lib minifb)
+target_link_libraries(minigui PRIVATE microui_lib minifb glm::glm)
 target_include_directories(minigui PRIVATE src ${microui_SOURCE_DIR}/src ${minifb_SOURCE_DIR}/include)
 target_include_directories(minigui PRIVATE src src/deps/minifb/include)
