@@ -10,6 +10,7 @@
 #include <sstream>
 #include <algorithm>
 #include <limits>
+#include <random>
 
 // GLM - Part 0 (Assignment 2)
 #include <glm/glm.hpp>
@@ -62,6 +63,9 @@ struct Mesh {
     std::vector<glm::vec3> face_normals;
     std::vector<glm::vec3> face_centers;
     std::vector<glm::vec3> vertex_normals;
+
+    // Assignment 4, Part 2: a random solid color per face
+    std::vector<uint32_t> face_colors;
 };
 
 // Loads a simple .obj file (v and f lines only)
@@ -171,6 +175,21 @@ static void compute_normals(Mesh& mesh) {
 }
 
 // -----------------------------------------------------------------------
+// Assignment 4, Part 2: assign each face a random solid color, once.
+// Seeded RNG so colors stay consistent between runs (not reshuffled
+// every frame or every restart).
+// -----------------------------------------------------------------------
+static void compute_face_colors(Mesh& mesh) {
+    mesh.face_colors.resize(mesh.faces.size());
+    std::mt19937 rng(1234);
+    std::uniform_int_distribution<int> dist(60, 255);
+    for (auto& c : mesh.face_colors) {
+        uint8_t r = (uint8_t)dist(rng), g = (uint8_t)dist(rng), b = (uint8_t)dist(rng);
+        c = MFB_RGB(r, g, b);
+    }
+}
+
+// -----------------------------------------------------------------------
 // Assignment 3, Part 1: Axis-aligned bounding box in local/object space.
 // -----------------------------------------------------------------------
 struct BBox { glm::vec3 mn, mx; };
@@ -272,6 +291,22 @@ static bool project_local_to_screen(const glm::vec3& local_pos, const glm::mat4&
 }
 
 // -----------------------------------------------------------------------
+// Assignment 4, Part 3: like project_local_to_screen, but also returns a
+// depth value for the Z-buffer - the point's distance from the camera
+// (positive, larger = farther), computed in View space rather than after
+// the projection matrix, so it means the same thing regardless of
+// perspective/orthographic mode or FOV.
+// -----------------------------------------------------------------------
+static bool project_local_to_screen_depth(const glm::vec3& local_pos, const glm::mat4& M,
+                                           const glm::mat4& View, const glm::mat4& VP,
+                                           glm::vec2& out_screen, float& out_depth) {
+    glm::vec3 world_pos = to_world(local_pos, M);
+    glm::vec4 view_pos = View * glm::vec4(world_pos, 1.0f);
+    out_depth = -view_pos.z; // camera looks down -Z in view space
+    return project_world_to_screen(world_pos, VP, out_screen);
+}
+
+// -----------------------------------------------------------------------
 // Assignment 2/3, Part 3: draw the wireframe mesh through the full
 // P * V * M pipeline.
 // -----------------------------------------------------------------------
@@ -285,6 +320,75 @@ static void draw_mesh(const Mesh& mesh, const glm::mat4& M, const glm::mat4& VP,
         if (ok0 && ok1) draw_line_gb((int)s0.x, (int)s0.y, (int)s1.x, (int)s1.y, color);
         if (ok1 && ok2) draw_line_gb((int)s1.x, (int)s1.y, (int)s2.x, (int)s2.y, color);
         if (ok2 && ok0) draw_line_gb((int)s2.x, (int)s2.y, (int)s0.x, (int)s0.y, color);
+    }
+}
+
+// -----------------------------------------------------------------------
+// Assignment 4, Part 1: naive bounding-box "rasterization" for debugging -
+// just fills the whole 2D screen-space rectangle around a triangle with a
+// solid color, no inside/outside test and no depth test. Used to sanity
+// check the projection pipeline before adding the real triangle fill.
+// -----------------------------------------------------------------------
+static void draw_triangle_bbox_debug(const glm::vec2& p0, const glm::vec2& p1,
+                                      const glm::vec2& p2, uint32_t color) {
+    int min_x = std::max(0, (int)floorf(std::min({p0.x, p1.x, p2.x})));
+    int max_x = std::min(WIDTH  - 1, (int)ceilf(std::max({p0.x, p1.x, p2.x})));
+    int min_y = std::max(0, (int)floorf(std::min({p0.y, p1.y, p2.y})));
+    int max_y = std::min(HEIGHT - 1, (int)ceilf(std::max({p0.y, p1.y, p2.y})));
+
+    for (int y = min_y; y <= max_y; y++)
+        for (int x = min_x; x <= max_x; x++)
+            g_buffer[y * WIDTH + x] = color;
+}
+
+// Signed area of the triangle (a,b,c) times 2 - also used as an edge
+// function: edge_function(a,b,p) is positive when p is to a consistent
+// side of the directed edge a->b.
+static float edge_function(const glm::vec2& a, const glm::vec2& b, const glm::vec2& c) {
+    return (c.x - a.x) * (b.y - a.y) - (c.y - a.y) * (b.x - a.x);
+}
+
+// -----------------------------------------------------------------------
+// Assignment 4, Parts 2 & 3: fill a triangle using Barycentric coordinates,
+// with a per-pixel Z-buffer test so nearer triangles correctly occlude
+// farther ones regardless of draw order.
+//
+// For every pixel in the triangle's bounding box, we compute barycentric
+// weights (w0, w1, w2) via the edge-function trick: each w_i is the
+// (normalized) signed area of the sub-triangle opposite vertex i. If all
+// three are >= 0, the pixel is inside. The interpolated depth is simply
+// w0*z0 + w1*z1 + w2*z2 (a plain weighted average - not perspective-
+// correct, but matches the assignment's stated formula and is a
+// reasonable approximation for a wireframe-scale model like ours).
+// -----------------------------------------------------------------------
+static void rasterize_triangle(const glm::vec2& p0, const glm::vec2& p1, const glm::vec2& p2,
+                                float z0, float z1, float z2,
+                                uint32_t color, std::vector<float>& zbuffer) {
+    int min_x = std::max(0, (int)floorf(std::min({p0.x, p1.x, p2.x})));
+    int max_x = std::min(WIDTH  - 1, (int)ceilf(std::max({p0.x, p1.x, p2.x})));
+    int min_y = std::max(0, (int)floorf(std::min({p0.y, p1.y, p2.y})));
+    int max_y = std::min(HEIGHT - 1, (int)ceilf(std::max({p0.y, p1.y, p2.y})));
+    if (min_x > max_x || min_y > max_y) return;
+
+    float area = edge_function(p0, p1, p2);
+    if (fabsf(area) < 1e-6f) return; // degenerate (zero-area) triangle
+
+    for (int y = min_y; y <= max_y; y++) {
+        for (int x = min_x; x <= max_x; x++) {
+            glm::vec2 p((float)x + 0.5f, (float)y + 0.5f); // sample pixel centers
+            float w0 = edge_function(p1, p2, p) / area;
+            float w1 = edge_function(p2, p0, p) / area;
+            float w2 = edge_function(p0, p1, p) / area;
+
+            if (w0 >= 0.0f && w1 >= 0.0f && w2 >= 0.0f) {
+                float depth = w0 * z0 + w1 * z1 + w2 * z2;
+                int idx = y * WIDTH + x;
+                if (depth < zbuffer[idx]) {
+                    zbuffer[idx] = depth;
+                    g_buffer[idx] = color;
+                }
+            }
+        }
     }
 }
 
@@ -452,6 +556,12 @@ int main() {
     // Assignment 3, Part 4: face/vertex normals, computed once in local space.
     compute_normals(base_mesh);
 
+    // Assignment 4, Part 2: a random solid color per face, computed once.
+    compute_face_colors(base_mesh);
+
+    // Assignment 4, Part 3: Z-buffer, one float per pixel, same size as g_buffer.
+    static std::vector<float> zbuffer(WIDTH * HEIGHT);
+
     // -----------------------------------------------------------------------
     // Assignment 2, Part 4 & 5: Transformation state variables (now in
     // world units instead of raw pixels).
@@ -488,6 +598,12 @@ int main() {
     static int show_normals = 0;
     static float axis_length   = 0.8f;
     static float normal_length = 0.25f;
+
+    // Assignment 4: rasterization toggles.
+    static int show_wireframe   = 1; // keep the old wireframe outline by default
+    static int show_bbox_debug  = 0; // Part 1: naive overlapping colored boxes
+    static int show_solid_fill  = 1; // Parts 2/3: barycentric fill + Z-buffer
+    static int show_zbuffer_view = 0; // Part 3: grayscale depth-map visualization
 
     // -----------------------------------------------------------------------
     // Assignment 1, Part 6: Interactive Line Drawing Tool state.
@@ -590,7 +706,49 @@ int main() {
         // ----------------------------------------------------------------
         // Draw: mesh, then debug overlays (P * V * M * v pipeline throughout)
         // ----------------------------------------------------------------
-        draw_mesh(base_mesh, M, VP, MFB_RGB(0, 220, 180));
+
+        // Assignment 4, Part 1: naive bounding-box debug view. Mutually
+        // exclusive with the real solid fill below - it exists purely to
+        // sanity-check the projection pipeline before trusting the
+        // barycentric test, so showing both at once would just be visual
+        // noise.
+        if (show_bbox_debug) {
+            std::mt19937 dbg_rng(4321);
+            std::uniform_int_distribution<int> dbg_dist(60, 255);
+            for (auto& f : base_mesh.faces) {
+                glm::vec2 s0, s1, s2;
+                bool ok0 = project_local_to_screen(base_mesh.vertices[f.v[0]], M, VP, s0);
+                bool ok1 = project_local_to_screen(base_mesh.vertices[f.v[1]], M, VP, s1);
+                bool ok2 = project_local_to_screen(base_mesh.vertices[f.v[2]], M, VP, s2);
+                if (ok0 && ok1 && ok2) {
+                    uint32_t rc = MFB_RGB((uint8_t)dbg_dist(dbg_rng), (uint8_t)dbg_dist(dbg_rng),
+                                           (uint8_t)dbg_dist(dbg_rng));
+                    draw_triangle_bbox_debug(s0, s1, s2, rc);
+                }
+            }
+        }
+
+        // Assignment 4, Parts 2 & 3: solid barycentric fill with Z-buffer.
+        // Needed whenever we want to *display* the solid render, or when we
+        // only need the Z-buffer populated for the depth-map visualization
+        // (in which case its color writes get discarded by that final
+        // grayscale overwrite below anyway, so it's harmless to run even
+        // if the bbox-debug view above also happened to be checked).
+        bool need_rasterize = show_solid_fill || show_zbuffer_view;
+        if (need_rasterize) {
+            std::fill(zbuffer.begin(), zbuffer.end(), std::numeric_limits<float>::max());
+            for (size_t i = 0; i < base_mesh.faces.size(); i++) {
+                const Face& f = base_mesh.faces[i];
+                glm::vec2 s0, s1, s2; float z0, z1, z2;
+                bool ok0 = project_local_to_screen_depth(base_mesh.vertices[f.v[0]], M, View, VP, s0, z0);
+                bool ok1 = project_local_to_screen_depth(base_mesh.vertices[f.v[1]], M, View, VP, s1, z1);
+                bool ok2 = project_local_to_screen_depth(base_mesh.vertices[f.v[2]], M, View, VP, s2, z2);
+                if (ok0 && ok1 && ok2)
+                    rasterize_triangle(s0, s1, s2, z0, z1, z2, base_mesh.face_colors[i], zbuffer);
+            }
+        }
+
+        if (show_wireframe) draw_mesh(base_mesh, M, VP, MFB_RGB(0, 220, 180));
         if (show_bbox)    draw_bbox(bbox, M, VP, MFB_RGB(255, 210, 60));
         if (show_axes)    draw_axes(M, VP, axis_length);
         if (show_normals) draw_normals(base_mesh, M, VP, normal_length,
@@ -729,6 +887,25 @@ int main() {
             mu_end_window(ctx);
         }
 
+        // ---- HW4: Rasterization window (Assignment 4, Parts 1, 2, 3) ----
+        if (mu_begin_window(ctx, "HW4: Rasterization", mu_rect(1040, 420, 320, 300))) {
+            int w[] = {-1};
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "-- Part 1 --");
+            mu_layout_row(ctx, 1, w, 0);
+            mu_checkbox(ctx, "BBox Rasterization (debug)", &show_bbox_debug);
+
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "-- Parts 2 & 3 --");
+            mu_layout_row(ctx, 1, w, 0);
+            mu_checkbox(ctx, "Solid Fill (Barycentric + Z-buffer)", &show_solid_fill);
+            mu_layout_row(ctx, 1, w, 0);
+            mu_checkbox(ctx, "Show Z-Buffer (grayscale depth map)", &show_zbuffer_view);
+
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "-- Other --");
+            mu_layout_row(ctx, 1, w, 0);
+            mu_checkbox(ctx, "Show Wireframe Outline", &show_wireframe);
+            mu_end_window(ctx);
+        }
+
         // ---- Debug Visualization window (Assignment 3, Parts 1 & 4) ----
         if (mu_begin_window(ctx, "Debug Visualization", mu_rect(700, 460, 320, 260))) {
             int w[] = {-1};
@@ -789,6 +966,29 @@ int main() {
         mu_end(ctx);
 
         if (quit_requested) { mfb_close(window); break; }
+
+        // ----------------------------------------------------------------
+        // Assignment 4, Part 3: Z-buffer visualization. Overwrites the
+        // whole color buffer with a grayscale depth map (closer = lighter)
+        // so it can be screenshotted side-by-side with the normal color
+        // render, per the assignment's report requirement. Runs after
+        // everything else so the depth map is clean and undisturbed by
+        // wireframe/axes/line-tool overlays.
+        // ----------------------------------------------------------------
+        if (show_zbuffer_view) {
+            float range = far_plane - near_plane;
+            for (int i = 0; i < WIDTH * HEIGHT; i++) {
+                float d = zbuffer[i];
+                if (d >= std::numeric_limits<float>::max()) {
+                    g_buffer[i] = MFB_RGB(0, 0, 0); // nothing drawn there: background = black
+                } else {
+                    float t = (d - near_plane) / (range > 1e-6f ? range : 1.0f);
+                    t = std::max(0.0f, std::min(1.0f, t));
+                    uint8_t gray = (uint8_t)(255.0f * (1.0f - t)); // closer = lighter
+                    g_buffer[i] = MFB_RGB(gray, gray, gray);
+                }
+            }
+        }
 
         // ----------------------------------------------------------------
         // 4. UI Rendering
