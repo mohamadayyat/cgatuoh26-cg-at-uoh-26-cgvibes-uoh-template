@@ -27,6 +27,16 @@ extern "C" {
 static uint32_t g_buffer[WIDTH * HEIGHT];
 
 // -----------------------------------------------------------------------
+// Assignment 1, Parts 1/3/5: creative background pattern state.
+// File-scope (not local to main) because the char-input callback below is
+// a plain function pointer (no captures allowed), so it can only reach
+// state through globals/statics - the same reason g_pending_text in
+// ui_bridge.h is file-scope.
+// -----------------------------------------------------------------------
+static float g_bg_phase = 0.0f;     // Part 5: driven by a UI slider
+static float g_bg_ring_scale = 0.05f; // Part 5: driven by a UI slider
+
+// -----------------------------------------------------------------------
 // Part 0 (Assignment 2): GLM demo - runs once at startup, prints to console
 // -----------------------------------------------------------------------
 static void glm_demo() {
@@ -392,8 +402,22 @@ int main() {
 
     UIRenderer renderer(WIDTH, HEIGHT);
 
+    // -----------------------------------------------------------------------
+    // Assignment 1, Part 3: character input callback, extended with a
+    // custom visual effect trigger.
+    //
+    // Pressing 'r'/'R' reshuffles the background pattern's phase (see the
+    // Background section below) instead of being typed anywhere - so we
+    // *consume* it here (return without forwarding). Every other key is
+    // passed along to ui_bridge_char_input as before, so text fields (like
+    // MicroUI's textboxes) still receive normal typed characters.
+    // -----------------------------------------------------------------------
     mfb_set_char_input_callback(
         [](struct mfb_window* w, unsigned int c){
+            if (c == 'r' || c == 'R') {
+                g_bg_phase = (float)(rand() % 1000) * 0.01f; // consumed, not forwarded
+                return;
+            }
             extern void ui_bridge_char_input(struct mfb_window*, unsigned int);
             ui_bridge_char_input(w, c);
         }, window);
@@ -465,6 +489,29 @@ int main() {
     static float axis_length   = 0.8f;
     static float normal_length = 0.25f;
 
+    // -----------------------------------------------------------------------
+    // Assignment 1, Part 6: Interactive Line Drawing Tool state.
+    //
+    // UX choice (per the assignment's "AI-Assisted UX Planning" task):
+    // click-and-drag-and-release, not click-click. Reasoning: click-click
+    // requires the tool to remember "we're mid-line" as separate hidden
+    // state across frames with no visual anchor between the two clicks,
+    // which is easy to leave dangling (e.g. if the user clicks a UI button
+    // instead of a second point). Click-drag-release ties the "in
+    // progress" state directly to the mouse button being held, so there's
+    // no ambiguous in-between state, and the live preview line gives
+    // immediate visual feedback of exactly what will be committed.
+    // -----------------------------------------------------------------------
+    struct LineSeg { int x0, y0, x1, y1; uint32_t color; };
+    static std::vector<LineSeg> g_lines;
+    static bool  g_dragging = false;
+    static int   g_drawing_mode = 0; // int, not bool - mu_checkbox takes int*
+    static int   g_drag_x0 = 0, g_drag_y0 = 0;
+    static float line_r = 0.0f, line_g = 220.0f, line_b = 180.0f;
+
+    // Assignment 1, Part 2: demo widget state (toggleable label)
+    static int g_show_demo_label = 0;
+
     static bool quit_requested = false;
 
     char info_buf[128];
@@ -486,11 +533,23 @@ int main() {
 
         // ----------------------------------------------------------------
         // 2. Background
+        //
+        // Assignment 1, Part 1: a creative pattern using both x and y (not
+        // a solid color or a 1D strip) - concentric rings around the
+        // window center, colored by distance and angle, animated/tunable
+        // via g_bg_phase and g_bg_ring_scale (Part 5: bound to UI sliders
+        // below; Part 3: g_bg_phase is also reshuffled by pressing 'r').
         // ----------------------------------------------------------------
         for (int i = 0; i < WIDTH * HEIGHT; i++) {
             int x = i % WIDTH, y = i / WIDTH;
-            uint8_t r = 15, g = 15, b = 25; // dark background
-            if (x % 100 == 0 || y % 100 == 0) { r=30; g=30; b=45; } // subtle grid
+            float dx = (float)x - WIDTH * 0.5f;
+            float dy = (float)y - HEIGHT * 0.5f;
+            float dist = sqrtf(dx * dx + dy * dy);
+
+            uint8_t r = (uint8_t)(20 + 25 * sinf(dist * g_bg_ring_scale + g_bg_phase));
+            uint8_t g = (uint8_t)(18 + 20 * sinf(x * 0.008f - g_bg_phase * 0.7f));
+            uint8_t b = (uint8_t)(32 + 28 * cosf(y * 0.008f + g_bg_phase * 1.3f));
+
             g_buffer[i] = MFB_RGB(r, g, b);
         }
 
@@ -536,6 +595,36 @@ int main() {
         if (show_axes)    draw_axes(M, VP, axis_length);
         if (show_normals) draw_normals(base_mesh, M, VP, normal_length,
                                         MFB_RGB(255, 120, 255), MFB_RGB(120, 220, 255));
+
+        // ----------------------------------------------------------------
+        // Assignment 1, Part 6: Interactive Line Drawing Tool.
+        //
+        // Only captures mouse input while Drawing Mode is on, so it never
+        // fights with normal 3D-view interaction. Uses raw MiniFB mouse
+        // state (not MicroUI's) since this is drawing on the canvas
+        // itself, not on a UI widget.
+        // ----------------------------------------------------------------
+        if (g_drawing_mode) {
+            const uint8_t* mbtn = mfb_get_mouse_button_buffer(window);
+            int mx = mfb_get_mouse_x(window), my = mfb_get_mouse_y(window);
+            static bool prev_down = false;
+            bool down = mbtn[MFB_MOUSE_LEFT] != 0;
+
+            if (down && !prev_down) {                 // press: start a new line
+                g_dragging = true;
+                g_drag_x0 = mx; g_drag_y0 = my;
+            } else if (!down && prev_down && g_dragging) { // release: commit it
+                uint32_t col = MFB_RGB((uint8_t)line_r, (uint8_t)line_g, (uint8_t)line_b);
+                g_lines.push_back({g_drag_x0, g_drag_y0, mx, my, col});
+                g_dragging = false;
+            }
+            prev_down = down;
+
+            if (g_dragging) // live preview of the line currently being dragged
+                draw_line_gb(g_drag_x0, g_drag_y0, mx, my, MFB_RGB(255, 255, 255));
+        }
+        // Permanent lines stay visible whether or not Drawing Mode is on.
+        for (auto& l : g_lines) draw_line_gb(l.x0, l.y0, l.x1, l.y1, l.color);
 
         // ----------------------------------------------------------------
         // 3. UI Logic
@@ -655,6 +744,45 @@ int main() {
 
             mu_layout_row(ctx, 1, w, 0);
             if (mu_button(ctx, "Quit")) quit_requested = true;
+            mu_end_window(ctx);
+        }
+
+        // ---- HW1: Background & Drawing Tool window (Assignment 1, Parts 1,2,3,5,6) ----
+        if (mu_begin_window(ctx, "HW1: Background & Drawing", mu_rect(360, 540, 320, 420))) {
+            int w[] = {-1};
+
+            // Part 1/5: sliders bound to the creative background pattern.
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "-- Background Pattern (Part 1/5) --");
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "Ring scale:");
+            mu_layout_row(ctx, 1, w, 0); mu_slider(ctx, &g_bg_ring_scale, 0.01f, 0.2f);
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "Phase:");
+            mu_layout_row(ctx, 1, w, 0); mu_slider(ctx, &g_bg_phase, 0.0f, 10.0f);
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "(Part 3: press 'R' to reshuffle phase)");
+
+            // Part 2: a plain widget demo (button + toggled label).
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "-- Widget Demo (Part 2) --");
+            mu_layout_row(ctx, 1, w, 0);
+            if (mu_button(ctx, "Print Mesh Info to Console")) {
+                printf("[Part 2 Demo] Mesh has %d vertices and %d faces.\n",
+                       (int)base_mesh.vertices.size(), (int)base_mesh.faces.size());
+            }
+            mu_layout_row(ctx, 1, w, 0); mu_checkbox(ctx, "Show demo label", &g_show_demo_label);
+            if (g_show_demo_label) {
+                mu_layout_row(ctx, 1, w, 0);
+                mu_label(ctx, "Hello from a MicroUI checkbox-bound label!");
+            }
+
+            // Part 6: interactive line drawing tool controls.
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "-- Drawing Tool (Part 6) --");
+            mu_layout_row(ctx, 1, w, 0);
+            mu_checkbox(ctx, "Drawing Mode (click+drag on canvas)", &g_drawing_mode);
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "Line color (R,G,B):");
+            mu_layout_row(ctx, 1, w, 0); mu_slider(ctx, &line_r, 0, 255);
+            mu_layout_row(ctx, 1, w, 0); mu_slider(ctx, &line_g, 0, 255);
+            mu_layout_row(ctx, 1, w, 0); mu_slider(ctx, &line_b, 0, 255);
+            mu_layout_row(ctx, 1, w, 0);
+            if (mu_button(ctx, "Clear Lines")) g_lines.clear();
+
             mu_end_window(ctx);
         }
 
