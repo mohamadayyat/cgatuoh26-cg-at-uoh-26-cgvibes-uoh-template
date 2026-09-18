@@ -66,6 +66,12 @@ struct Mesh {
 
     // Assignment 4, Part 2: a random solid color per face
     std::vector<uint32_t> face_colors;
+
+    // Final Project: procedural per-vertex color (height-based "texture"
+    // substitute), and its per-face average for flat-shading modes. Empty
+    // for meshes that don't use procedural coloring (e.g. the loaded cube).
+    std::vector<glm::vec3> vertex_colors;
+    std::vector<glm::vec3> face_avg_colors;
 };
 
 // Loads a simple .obj file (v and f lines only)
@@ -186,6 +192,191 @@ static void compute_face_colors(Mesh& mesh) {
     for (auto& c : mesh.face_colors) {
         uint8_t r = (uint8_t)dist(rng), g = (uint8_t)dist(rng), b = (uint8_t)dist(rng);
         c = MFB_RGB(r, g, b);
+    }
+}
+
+// =========================================================================
+// Final Project: Procedural Terrain Generation
+//
+// Topic chosen from the syllabus's uncovered ground: "Procedural Modeling"
+// and "Procedural Textures" (and, via the height-based color bands below,
+// "Intro to Color Theory"). Rather than a standalone demo, this plugs
+// straight into the renderer built across the semester's assignments: a
+// generated terrain is just another Mesh, so it goes through the exact
+// same normalize/compute_normals/camera/Phong-lighting/Z-buffer pipeline
+// as the cube from Assignment 2 - which is the point: the engine built
+// incrementally in HW1-HW5 generalizes to new content without changes.
+// =========================================================================
+
+// -------------------------------------------------------------------
+// Perlin's classic 1985 gradient noise (reimplemented from the public-
+// domain reference algorithm - permutation table + fade curve + gradient
+// dot products - not copied from any specific codebase). Written from
+// scratch here in 2D, which is all a heightmap needs.
+// -------------------------------------------------------------------
+static int g_perlin_perm[512];
+
+static void perlin_seed(unsigned int seed) {
+    std::vector<int> p(256);
+    for (int i = 0; i < 256; i++) p[i] = i;
+    std::mt19937 rng(seed);
+    std::shuffle(p.begin(), p.end(), rng);
+    for (int i = 0; i < 512; i++) g_perlin_perm[i] = p[i & 255];
+}
+
+// Ken Perlin's improved fade curve: 6t^5 - 15t^4 + 10t^3. Smoother than a
+// plain linear or cubic interpolation, so the noise has continuous second
+// derivatives (no visible creases where grid cells meet).
+static float perlin_fade(float t) { return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f); }
+static float perlin_lerp(float a, float b, float t) { return a + t * (b - a); }
+
+// Pseudo-random gradient direction for a grid corner, picked from 8 fixed
+// directions via the hash - then dotted with the offset vector (x,y) from
+// that corner to the sample point.
+static float perlin_grad(int hash, float x, float y) {
+    int h = hash & 7;
+    float u = (h < 4) ? x : y;
+    float v = (h < 4) ? y : x;
+    return ((h & 1) ? -u : u) + ((h & 2) ? -2.0f * v : 2.0f * v);
+}
+
+// 2D Perlin noise at (x, y), roughly in [-1, 1].
+static float perlin2(float x, float y) {
+    int xi = (int)floorf(x) & 255;
+    int yi = (int)floorf(y) & 255;
+    float xf = x - floorf(x);
+    float yf = y - floorf(y);
+    float u = perlin_fade(xf);
+    float v = perlin_fade(yf);
+
+    int aa = g_perlin_perm[g_perlin_perm[xi] + yi];
+    int ab = g_perlin_perm[g_perlin_perm[xi] + yi + 1];
+    int ba = g_perlin_perm[g_perlin_perm[xi + 1] + yi];
+    int bb = g_perlin_perm[g_perlin_perm[xi + 1] + yi + 1];
+
+    float x1 = perlin_lerp(perlin_grad(aa, xf, yf),     perlin_grad(ba, xf - 1.0f, yf), u);
+    float x2 = perlin_lerp(perlin_grad(ab, xf, yf - 1.0f), perlin_grad(bb, xf - 1.0f, yf - 1.0f), u);
+    return perlin_lerp(x1, x2, v);
+}
+
+// Fractal Brownian Motion: sum several "octaves" of Perlin noise at
+// increasing frequency (lacunarity) and decreasing amplitude (persistence)
+// on top of each other. This is what turns smooth, blobby Perlin noise
+// into natural-looking terrain with both large rolling hills (low-
+// frequency octaves) and small rocky detail (high-frequency octaves).
+static float fbm(float x, float y, int octaves, float persistence, float lacunarity) {
+    float total = 0.0f, amplitude = 1.0f, frequency = 1.0f, max_amp = 0.0f;
+    for (int i = 0; i < octaves; i++) {
+        total += perlin2(x * frequency, y * frequency) * amplitude;
+        max_amp += amplitude;
+        amplitude *= persistence;
+        frequency *= lacunarity;
+    }
+    return total / std::max(max_amp, 1e-6f); // normalize back to roughly [-1, 1]
+}
+
+// -------------------------------------------------------------------
+// Procedural coloring (a stand-in for texture mapping, and the "Intro to
+// Color Theory" topic): a fixed palette of colors banded by normalized
+// height (water -> sand -> grass -> rock -> snow), linearly blended
+// between adjacent bands so the transitions aren't hard edges.
+// -------------------------------------------------------------------
+static glm::vec3 terrain_color_for_height(float t) { // t expected in [0,1]
+    struct Band { float t; glm::vec3 color; };
+    static const Band bands[] = {
+        {0.00f, {0.10f, 0.25f, 0.55f}}, // deep water
+        {0.30f, {0.85f, 0.75f, 0.45f}}, // sand
+        {0.40f, {0.20f, 0.55f, 0.15f}}, // grass
+        {0.65f, {0.45f, 0.40f, 0.35f}}, // rock
+        {0.85f, {0.95f, 0.95f, 0.98f}}, // snow
+        {1.00f, {1.00f, 1.00f, 1.00f}},
+    };
+    constexpr int n = sizeof(bands) / sizeof(bands[0]);
+    t = std::max(0.0f, std::min(1.0f, t));
+    for (int i = 0; i < n - 1; i++) {
+        if (t >= bands[i].t && t <= bands[i + 1].t) {
+            float local_t = (t - bands[i].t) / std::max(bands[i + 1].t - bands[i].t, 1e-6f);
+            return glm::mix(bands[i].color, bands[i + 1].color, local_t);
+        }
+    }
+    return bands[n - 1].color;
+}
+
+// -------------------------------------------------------------------
+// Terrain generation parameters, all exposed on the UI panel.
+// -------------------------------------------------------------------
+struct TerrainParams {
+    unsigned int seed = 1337;
+    int   resolution  = 48;   // NxN grid of vertices
+    float world_size  = 3.0f; // spans -size/2..+size/2 on X and Z, world units
+    float height_scale = 0.5f;
+    float noise_scale  = 1.5f; // higher = more, smaller hills
+    int   octaves      = 4;
+    float persistence  = 0.5f;
+    float lacunarity   = 2.0f;
+};
+
+// Builds a heightmap-based terrain mesh: an NxN grid of vertices whose Y
+// is driven by fBm noise, triangulated into a regular grid (2 triangles
+// per quad), with a procedural color baked into each vertex from its
+// normalized height. Reuses the existing Mesh struct so everything else
+// in the renderer (normals, bounding box, lighting, rasterization) just
+// works on it unmodified.
+static void generate_terrain(Mesh& mesh, const TerrainParams& params) {
+    perlin_seed(params.seed);
+    int N = std::max(2, params.resolution);
+
+    std::vector<float> heights((size_t)N * N);
+    float min_h = 1e9f, max_h = -1e9f;
+    for (int z = 0; z < N; z++) {
+        for (int x = 0; x < N; x++) {
+            float nx = (float)x / (float)(N - 1) * params.noise_scale;
+            float nz = (float)z / (float)(N - 1) * params.noise_scale;
+            float h = fbm(nx, nz, params.octaves, params.persistence, params.lacunarity);
+            heights[z * N + x] = h;
+            min_h = std::min(min_h, h);
+            max_h = std::max(max_h, h);
+        }
+    }
+    float range = std::max(max_h - min_h, 1e-6f);
+
+    mesh.vertices.clear();
+    mesh.vertex_colors.clear();
+    mesh.faces.clear();
+    mesh.vertices.resize((size_t)N * N);
+    mesh.vertex_colors.resize((size_t)N * N);
+
+    for (int z = 0; z < N; z++) {
+        for (int x = 0; x < N; x++) {
+            float world_x = ((float)x / (float)(N - 1) - 0.5f) * params.world_size;
+            float world_z = ((float)z / (float)(N - 1) - 0.5f) * params.world_size;
+            float h_norm  = (heights[z * N + x] - min_h) / range; // [0,1]
+            float world_y = (h_norm - 0.5f) * params.height_scale * 2.0f; // centered on Y=0
+
+            mesh.vertices[z * N + x]      = glm::vec3(world_x, world_y, world_z);
+            mesh.vertex_colors[z * N + x] = terrain_color_for_height(h_norm);
+        }
+    }
+
+    for (int z = 0; z < N - 1; z++) {
+        for (int x = 0; x < N - 1; x++) {
+            int i0 = z * N + x,       i1 = z * N + x + 1;
+            int i2 = (z + 1) * N + x, i3 = (z + 1) * N + x + 1;
+            mesh.faces.push_back({i0, i2, i1});
+            mesh.faces.push_back({i1, i2, i3});
+        }
+    }
+}
+
+// Precomputes each face's average vertex color, for use by the flat-
+// shading stages (which need one color per face, not per pixel).
+static void compute_face_avg_colors(Mesh& mesh) {
+    mesh.face_avg_colors.resize(mesh.faces.size());
+    for (size_t i = 0; i < mesh.faces.size(); i++) {
+        const Face& f = mesh.faces[i];
+        mesh.face_avg_colors[i] = (mesh.vertex_colors[f.v[0]] +
+                                    mesh.vertex_colors[f.v[1]] +
+                                    mesh.vertex_colors[f.v[2]]) / 3.0f;
     }
 }
 
@@ -505,6 +696,60 @@ static void rasterize_triangle_phong(const glm::vec2& p0, const glm::vec2& p1, c
 }
 
 // -----------------------------------------------------------------------
+// Final Project: like rasterize_triangle_phong, but the material's
+// ambient/diffuse color is itself interpolated per pixel from the three
+// vertices' procedural colors (the same barycentric weights already used
+// for position/normal/depth) - a direct, from-scratch stand-in for
+// texture-mapped UV lookups, using per-vertex procedural color instead of
+// a sampled image.
+// -----------------------------------------------------------------------
+static void rasterize_triangle_phong_textured(const glm::vec2& p0, const glm::vec2& p1, const glm::vec2& p2,
+                                               float z0, float z1, float z2,
+                                               const glm::vec3& wp0, const glm::vec3& wp1, const glm::vec3& wp2,
+                                               const glm::vec3& wn0, const glm::vec3& wn1, const glm::vec3& wn2,
+                                               const glm::vec3& c0, const glm::vec3& c1, const glm::vec3& c2,
+                                               const glm::vec3& cam_pos_world,
+                                               const PointLight& light, const Material& base_mat,
+                                               std::vector<float>& zbuffer) {
+    int min_x = std::max(0, (int)floorf(std::min({p0.x, p1.x, p2.x})));
+    int max_x = std::min(WIDTH  - 1, (int)ceilf(std::max({p0.x, p1.x, p2.x})));
+    int min_y = std::max(0, (int)floorf(std::min({p0.y, p1.y, p2.y})));
+    int max_y = std::min(HEIGHT - 1, (int)ceilf(std::max({p0.y, p1.y, p2.y})));
+    if (min_x > max_x || min_y > max_y) return;
+
+    float area = edge_function(p0, p1, p2);
+    if (fabsf(area) < 1e-6f) return;
+
+    for (int y = min_y; y <= max_y; y++) {
+        for (int x = min_x; x <= max_x; x++) {
+            glm::vec2 p((float)x + 0.5f, (float)y + 0.5f);
+            float w0 = edge_function(p1, p2, p) / area;
+            float w1 = edge_function(p2, p0, p) / area;
+            float w2 = edge_function(p0, p1, p) / area;
+
+            if (w0 >= 0.0f && w1 >= 0.0f && w2 >= 0.0f) {
+                float depth = w0 * z0 + w1 * z1 + w2 * z2;
+                int idx = y * WIDTH + x;
+                if (depth < zbuffer[idx]) {
+                    glm::vec3 pos_world    = w0 * wp0 + w1 * wp1 + w2 * wp2;
+                    glm::vec3 normal_world = glm::normalize(w0 * wn0 + w1 * wn1 + w2 * wn2);
+                    glm::vec3 sample_color = w0 * c0 + w1 * c1 + w2 * c2; // the "texture lookup"
+
+                    Material mat = base_mat;
+                    mat.ambient = sample_color;
+                    mat.diffuse = sample_color; // specular stays the base material's (usually white highlights)
+
+                    glm::vec3 lit = compute_phong_color(pos_world, normal_world, cam_pos_world,
+                                                         STAGE_PHONG_PIXEL, light, mat);
+                    zbuffer[idx] = depth;
+                    g_buffer[idx] = color_from_vec3(lit);
+                }
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
 // Assignment 5, Part 3: debug visualization - draws the incoming Light
 // Vector (yellow) and outgoing Reflection Vector (cyan) from the center
 // of a handful of faces, so the reflection math can be visually verified
@@ -700,6 +945,16 @@ int main() {
     // Assignment 4, Part 2: a random solid color per face, computed once.
     compute_face_colors(base_mesh);
 
+    // Final Project: keep a copy of the original cube so switching Terrain
+    // Mode off can restore it instantly without reloading/renormalizing.
+    Mesh  original_cube_mesh = base_mesh;
+    BBox  original_cube_bbox = bbox;
+
+    // Final Project: procedural terrain state.
+    static TerrainParams terrain_params;
+    static int  use_terrain           = 0; // int, not bool - mu_checkbox takes int*
+    static int  proc_coloring_enabled = 1;
+
     // Assignment 4, Part 3: Z-buffer, one float per pixel, same size as g_buffer.
     static std::vector<float> zbuffer(WIDTH * HEIGHT);
 
@@ -779,9 +1034,7 @@ int main() {
 
     static bool quit_requested = false;
 
-    char info_buf[128];
-    snprintf(info_buf, sizeof(info_buf), "Vertices: %d  Faces: %d",
-             (int)base_mesh.vertices.size(), (int)base_mesh.faces.size());
+    char info_buf[128]; // filled fresh each frame now (mesh can change via Terrain Mode)
 
     while (mfb_update_events(window) != MFB_STATE_EXIT) {
         // ----------------------------------------------------------------
@@ -889,7 +1142,14 @@ int main() {
         // either one flat color per face (Parts 1-3: Ambient / +Diffuse /
         // +Specular), or a genuinely different color per pixel via
         // rasterize_triangle_phong (Part 4).
+        //
+        // Final Project: when the current mesh has procedural vertex
+        // colors (i.e. it's the generated terrain, with coloring turned
+        // on), those replace the material's ambient/diffuse wherever a
+        // color would otherwise be used - the flat and per-pixel paths
+        // each get their own procedural variant below.
         bool need_rasterize = show_solid_fill || show_zbuffer_view;
+        bool has_proc_color = use_terrain && proc_coloring_enabled && !base_mesh.vertex_colors.empty();
         if (need_rasterize) {
             std::fill(zbuffer.begin(), zbuffer.end(), std::numeric_limits<float>::max());
             glm::mat3 normal_mat = glm::transpose(glm::inverse(glm::mat3(M)));
@@ -903,14 +1163,21 @@ int main() {
                 if (!(ok0 && ok1 && ok2)) continue;
 
                 if (!lighting_enabled) {
-                    rasterize_triangle(s0, s1, s2, z0, z1, z2, base_mesh.face_colors[i], zbuffer);
+                    uint32_t col = has_proc_color ? color_from_vec3(base_mesh.face_avg_colors[i])
+                                                   : base_mesh.face_colors[i];
+                    rasterize_triangle(s0, s1, s2, z0, z1, z2, col, zbuffer);
                 } else if (lighting_stage != STAGE_PHONG_PIXEL) {
                     // Flat Shading (Parts 1-3): light once, using the face
                     // center and face normal, in world space.
                     glm::vec3 center_world = to_world(base_mesh.face_centers[i], M);
                     glm::vec3 normal_world = glm::normalize(normal_mat * base_mesh.face_normals[i]);
+                    Material eff_mat = material;
+                    if (has_proc_color) {
+                        eff_mat.ambient = base_mesh.face_avg_colors[i];
+                        eff_mat.diffuse = base_mesh.face_avg_colors[i];
+                    }
                     glm::vec3 lit = compute_phong_color(center_world, normal_world, camera.position,
-                                                         lighting_stage, light, material);
+                                                         lighting_stage, light, eff_mat);
                     rasterize_triangle(s0, s1, s2, z0, z1, z2, color_from_vec3(lit), zbuffer);
                 } else {
                     // Phong Shading (Part 4): per-pixel, via world-space
@@ -921,8 +1188,15 @@ int main() {
                     glm::vec3 wn0 = glm::normalize(normal_mat * base_mesh.vertex_normals[f.v[0]]);
                     glm::vec3 wn1 = glm::normalize(normal_mat * base_mesh.vertex_normals[f.v[1]]);
                     glm::vec3 wn2 = glm::normalize(normal_mat * base_mesh.vertex_normals[f.v[2]]);
-                    rasterize_triangle_phong(s0, s1, s2, z0, z1, z2, wp0, wp1, wp2, wn0, wn1, wn2,
-                                              camera.position, light, material, zbuffer);
+                    if (has_proc_color) {
+                        rasterize_triangle_phong_textured(
+                            s0, s1, s2, z0, z1, z2, wp0, wp1, wp2, wn0, wn1, wn2,
+                            base_mesh.vertex_colors[f.v[0]], base_mesh.vertex_colors[f.v[1]],
+                            base_mesh.vertex_colors[f.v[2]], camera.position, light, material, zbuffer);
+                    } else {
+                        rasterize_triangle_phong(s0, s1, s2, z0, z1, z2, wp0, wp1, wp2, wn0, wn1, wn2,
+                                                  camera.position, light, material, zbuffer);
+                    }
                 }
             }
         }
@@ -971,6 +1245,9 @@ int main() {
         mu_begin(ctx);
 
         // ---- Mesh Info window ----
+        snprintf(info_buf, sizeof(info_buf), "Vertices: %d  Faces: %d  (%s)",
+                 (int)base_mesh.vertices.size(), (int)base_mesh.faces.size(),
+                 use_terrain ? "Terrain" : "Cube");
         if (mu_begin_window(ctx, "Mesh Info", mu_rect(20, 20, 320, 80))) {
             int w[] = {-1};
             mu_layout_row(ctx, 1, w, 0);
@@ -1146,6 +1423,68 @@ int main() {
 
             mu_layout_row(ctx, 1, w, 0);
             if (mu_button(ctx, "Quit")) quit_requested = true;
+            mu_end_window(ctx);
+        }
+
+        // ---- Final Project: Procedural Terrain window ----
+        if (mu_begin_window(ctx, "Final Project: Terrain", mu_rect(20, 500, 320, 460))) {
+            int w[] = {-1};
+
+            bool was_on = (use_terrain != 0);
+            mu_layout_row(ctx, 1, w, 0);
+            mu_checkbox(ctx, "Terrain Mode", &use_terrain);
+            bool now_on = (use_terrain != 0);
+
+            mu_layout_row(ctx, 1, w, 0);
+            mu_checkbox(ctx, "Procedural Coloring", &proc_coloring_enabled);
+
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "Seed:");
+            float seed_f = (float)terrain_params.seed;
+            mu_layout_row(ctx, 1, w, 0); mu_slider(ctx, &seed_f, 1, 9999);
+            terrain_params.seed = (unsigned int)seed_f;
+
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "Resolution (grid NxN):");
+            float res_f = (float)terrain_params.resolution;
+            mu_layout_row(ctx, 1, w, 0); mu_slider(ctx, &res_f, 8, 96);
+            terrain_params.resolution = (int)(res_f + 0.5f);
+
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "World size:");
+            mu_layout_row(ctx, 1, w, 0); mu_slider(ctx, &terrain_params.world_size, 1.0f, 8.0f);
+
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "Height scale:");
+            mu_layout_row(ctx, 1, w, 0); mu_slider(ctx, &terrain_params.height_scale, 0.05f, 1.5f);
+
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "Noise scale (feature size):");
+            mu_layout_row(ctx, 1, w, 0); mu_slider(ctx, &terrain_params.noise_scale, 0.3f, 5.0f);
+
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "Octaves:");
+            float oct_f = (float)terrain_params.octaves;
+            mu_layout_row(ctx, 1, w, 0); mu_slider(ctx, &oct_f, 1, 8);
+            terrain_params.octaves = (int)(oct_f + 0.5f);
+
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "Persistence:");
+            mu_layout_row(ctx, 1, w, 0); mu_slider(ctx, &terrain_params.persistence, 0.1f, 0.9f);
+
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "Lacunarity:");
+            mu_layout_row(ctx, 1, w, 0); mu_slider(ctx, &terrain_params.lacunarity, 1.5f, 3.0f);
+
+            mu_layout_row(ctx, 1, w, 0);
+            bool regen_clicked = mu_button(ctx, "Regenerate Terrain");
+
+            // Regenerate on: turning Terrain Mode on, or an explicit
+            // Regenerate click while already in Terrain Mode. Turning
+            // Terrain Mode off just restores the original cube instantly.
+            if (now_on && (!was_on || regen_clicked)) {
+                generate_terrain(base_mesh, terrain_params);
+                bbox = compute_bbox(base_mesh);
+                compute_normals(base_mesh);
+                compute_face_colors(base_mesh);      // fallback for lighting-off mode
+                compute_face_avg_colors(base_mesh);  // for flat-shading modes
+            } else if (!now_on && was_on) {
+                base_mesh = original_cube_mesh;
+                bbox = original_cube_bbox;
+            }
+
             mu_end_window(ctx);
         }
 
