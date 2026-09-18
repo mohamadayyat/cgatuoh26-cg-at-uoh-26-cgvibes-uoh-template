@@ -392,6 +392,147 @@ static void rasterize_triangle(const glm::vec2& p0, const glm::vec2& p1, const g
     }
 }
 
+// =========================================================================
+// Assignment 5: Lighting, Materials, and Shading (Phong Reflection Model)
+// =========================================================================
+
+// Part 1: light and material properties.
+struct PointLight {
+    glm::vec3 position{2.5f, 3.0f, 4.0f};
+    glm::vec3 ambient{0.15f, 0.15f, 0.15f};
+    glm::vec3 diffuse{1.0f, 1.0f, 0.95f};
+    glm::vec3 specular{1.0f, 1.0f, 1.0f};
+};
+
+struct Material {
+    glm::vec3 ambient{0.75f, 0.35f, 0.15f};
+    glm::vec3 diffuse{0.75f, 0.35f, 0.15f};
+    glm::vec3 specular{1.0f, 1.0f, 1.0f};
+    float shininess = 32.0f;
+};
+
+// Shading stages, built up incrementally exactly as the assignment's
+// Parts 1-4 describe, so each one can be checked visually on its own.
+enum LightingStage {
+    STAGE_AMBIENT_ONLY  = 0, // Part 1
+    STAGE_FLAT_DIFFUSE  = 1, // Part 2
+    STAGE_FLAT_SPECULAR = 2, // Part 3
+    STAGE_PHONG_PIXEL   = 3, // Part 4
+};
+
+static uint32_t color_from_vec3(const glm::vec3& c) {
+    uint8_t r = (uint8_t)(std::max(0.0f, std::min(1.0f, c.r)) * 255.0f);
+    uint8_t g = (uint8_t)(std::max(0.0f, std::min(1.0f, c.g)) * 255.0f);
+    uint8_t b = (uint8_t)(std::max(0.0f, std::min(1.0f, c.b)) * 255.0f);
+    return MFB_RGB(r, g, b);
+}
+
+// -----------------------------------------------------------------------
+// Assignment 5, Parts 1-3: the full Ambient + Diffuse + Specular equation
+// for one point (position + normal, both in world space). Used both for
+// Flat Shading (called once per face, with the face center/normal) and,
+// with per-pixel interpolated inputs, for Phong Shading (Part 4).
+// -----------------------------------------------------------------------
+static glm::vec3 compute_phong_color(const glm::vec3& pos_world, const glm::vec3& normal_world,
+                                      const glm::vec3& view_pos_world, int stage,
+                                      const PointLight& light, const Material& mat) {
+    glm::vec3 ambient = light.ambient * mat.ambient; // Part 1
+
+    if (stage == STAGE_AMBIENT_ONLY) return ambient;
+
+    glm::vec3 N = glm::normalize(normal_world);
+    glm::vec3 L = glm::normalize(light.position - pos_world);
+    float diff = std::max(glm::dot(N, L), 0.0f); // Lambert's Cosine Law
+    glm::vec3 diffuse = light.diffuse * mat.diffuse * diff; // Part 2
+
+    if (stage == STAGE_FLAT_DIFFUSE) return ambient + diffuse;
+
+    glm::vec3 V = glm::normalize(view_pos_world - pos_world);
+    glm::vec3 R = glm::reflect(-L, N);
+    float spec = (diff > 0.0f) ? powf(std::max(glm::dot(R, V), 0.0f), mat.shininess) : 0.0f;
+    glm::vec3 specular = light.specular * mat.specular * spec; // Part 3
+
+    return ambient + diffuse + specular;
+}
+
+// -----------------------------------------------------------------------
+// Assignment 5, Part 4: Phong (per-pixel) Shading. Extends the Assignment
+// 4 barycentric rasterizer: instead of one flat color for the whole
+// triangle, every covered pixel interpolates its own world position and
+// world normal from the three vertices (using the same barycentric
+// weights already needed for the depth test), then runs the full
+// lighting equation on that interpolated pair.
+// -----------------------------------------------------------------------
+static void rasterize_triangle_phong(const glm::vec2& p0, const glm::vec2& p1, const glm::vec2& p2,
+                                      float z0, float z1, float z2,
+                                      const glm::vec3& wp0, const glm::vec3& wp1, const glm::vec3& wp2,
+                                      const glm::vec3& wn0, const glm::vec3& wn1, const glm::vec3& wn2,
+                                      const glm::vec3& cam_pos_world,
+                                      const PointLight& light, const Material& mat,
+                                      std::vector<float>& zbuffer) {
+    int min_x = std::max(0, (int)floorf(std::min({p0.x, p1.x, p2.x})));
+    int max_x = std::min(WIDTH  - 1, (int)ceilf(std::max({p0.x, p1.x, p2.x})));
+    int min_y = std::max(0, (int)floorf(std::min({p0.y, p1.y, p2.y})));
+    int max_y = std::min(HEIGHT - 1, (int)ceilf(std::max({p0.y, p1.y, p2.y})));
+    if (min_x > max_x || min_y > max_y) return;
+
+    float area = edge_function(p0, p1, p2);
+    if (fabsf(area) < 1e-6f) return;
+
+    for (int y = min_y; y <= max_y; y++) {
+        for (int x = min_x; x <= max_x; x++) {
+            glm::vec2 p((float)x + 0.5f, (float)y + 0.5f);
+            float w0 = edge_function(p1, p2, p) / area;
+            float w1 = edge_function(p2, p0, p) / area;
+            float w2 = edge_function(p0, p1, p) / area;
+
+            if (w0 >= 0.0f && w1 >= 0.0f && w2 >= 0.0f) {
+                float depth = w0 * z0 + w1 * z1 + w2 * z2;
+                int idx = y * WIDTH + x;
+                if (depth < zbuffer[idx]) {
+                    // 1. Interpolate position; 2/3. interpolate + normalize normal.
+                    glm::vec3 pos_world    = w0 * wp0 + w1 * wp1 + w2 * wp2;
+                    glm::vec3 normal_world = glm::normalize(w0 * wn0 + w1 * wn1 + w2 * wn2);
+                    // 4. Full lighting equation per pixel.
+                    glm::vec3 lit = compute_phong_color(pos_world, normal_world, cam_pos_world,
+                                                         STAGE_PHONG_PIXEL, light, mat);
+                    zbuffer[idx] = depth;
+                    g_buffer[idx] = color_from_vec3(lit);
+                }
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// Assignment 5, Part 3: debug visualization - draws the incoming Light
+// Vector (yellow) and outgoing Reflection Vector (cyan) from the center
+// of a handful of faces, so the reflection math can be visually verified
+// (and screenshotted for the report).
+// -----------------------------------------------------------------------
+static void draw_lighting_debug_vectors(const Mesh& mesh, const glm::mat4& M, const glm::mat4& VP,
+                                         const PointLight& light, float length, int max_faces) {
+    glm::mat3 normal_mat = glm::transpose(glm::inverse(glm::mat3(M)));
+    int n = std::min((int)mesh.faces.size(), max_faces);
+
+    for (int i = 0; i < n; i++) {
+        glm::vec3 center_world = to_world(mesh.face_centers[i], M);
+        glm::vec3 normal_world = glm::normalize(normal_mat * mesh.face_normals[i]);
+        glm::vec3 L = glm::normalize(light.position - center_world);
+        glm::vec3 R = glm::reflect(-L, normal_world);
+
+        glm::vec3 light_tip = center_world + L * length;
+        glm::vec3 refl_tip  = center_world + R * length;
+
+        glm::vec2 s0, s1, s2;
+        bool ok0 = project_world_to_screen(center_world, VP, s0);
+        bool ok1 = project_world_to_screen(light_tip, VP, s1);
+        bool ok2 = project_world_to_screen(refl_tip, VP, s2);
+        if (ok0 && ok1) draw_line_gb((int)s0.x, (int)s0.y, (int)s1.x, (int)s1.y, MFB_RGB(255, 255, 0)); // Light vector
+        if (ok0 && ok2) draw_line_gb((int)s0.x, (int)s0.y, (int)s2.x, (int)s2.y, MFB_RGB(0, 255, 255)); // Reflection vector
+    }
+}
+
 // -----------------------------------------------------------------------
 // Assignment 3, Part 1: draw the wireframe bounding box (8 corners, 12
 // edges), transformed by the same Model matrix as the mesh so it hugs the
@@ -605,6 +746,14 @@ int main() {
     static int show_solid_fill  = 1; // Parts 2/3: barycentric fill + Z-buffer
     static int show_zbuffer_view = 0; // Part 3: grayscale depth-map visualization
 
+    // Assignment 5: lighting state.
+    static PointLight light;
+    static Material   material;
+    static int   lighting_enabled = 0;
+    static int   lighting_stage   = STAGE_PHONG_PIXEL;
+    static int   show_light_debug = 0;
+    static float light_debug_length = 0.6f;
+
     // -----------------------------------------------------------------------
     // Assignment 1, Part 6: Interactive Line Drawing Tool state.
     //
@@ -734,17 +883,47 @@ int main() {
         // (in which case its color writes get discarded by that final
         // grayscale overwrite below anyway, so it's harmless to run even
         // if the bbox-debug view above also happened to be checked).
+        //
+        // Assignment 5: when lighting is enabled, the per-face random
+        // colors from HW4 are replaced by Phong-lit colors instead -
+        // either one flat color per face (Parts 1-3: Ambient / +Diffuse /
+        // +Specular), or a genuinely different color per pixel via
+        // rasterize_triangle_phong (Part 4).
         bool need_rasterize = show_solid_fill || show_zbuffer_view;
         if (need_rasterize) {
             std::fill(zbuffer.begin(), zbuffer.end(), std::numeric_limits<float>::max());
+            glm::mat3 normal_mat = glm::transpose(glm::inverse(glm::mat3(M)));
+
             for (size_t i = 0; i < base_mesh.faces.size(); i++) {
                 const Face& f = base_mesh.faces[i];
                 glm::vec2 s0, s1, s2; float z0, z1, z2;
                 bool ok0 = project_local_to_screen_depth(base_mesh.vertices[f.v[0]], M, View, VP, s0, z0);
                 bool ok1 = project_local_to_screen_depth(base_mesh.vertices[f.v[1]], M, View, VP, s1, z1);
                 bool ok2 = project_local_to_screen_depth(base_mesh.vertices[f.v[2]], M, View, VP, s2, z2);
-                if (ok0 && ok1 && ok2)
+                if (!(ok0 && ok1 && ok2)) continue;
+
+                if (!lighting_enabled) {
                     rasterize_triangle(s0, s1, s2, z0, z1, z2, base_mesh.face_colors[i], zbuffer);
+                } else if (lighting_stage != STAGE_PHONG_PIXEL) {
+                    // Flat Shading (Parts 1-3): light once, using the face
+                    // center and face normal, in world space.
+                    glm::vec3 center_world = to_world(base_mesh.face_centers[i], M);
+                    glm::vec3 normal_world = glm::normalize(normal_mat * base_mesh.face_normals[i]);
+                    glm::vec3 lit = compute_phong_color(center_world, normal_world, camera.position,
+                                                         lighting_stage, light, material);
+                    rasterize_triangle(s0, s1, s2, z0, z1, z2, color_from_vec3(lit), zbuffer);
+                } else {
+                    // Phong Shading (Part 4): per-pixel, via world-space
+                    // vertex positions and normals.
+                    glm::vec3 wp0 = to_world(base_mesh.vertices[f.v[0]], M);
+                    glm::vec3 wp1 = to_world(base_mesh.vertices[f.v[1]], M);
+                    glm::vec3 wp2 = to_world(base_mesh.vertices[f.v[2]], M);
+                    glm::vec3 wn0 = glm::normalize(normal_mat * base_mesh.vertex_normals[f.v[0]]);
+                    glm::vec3 wn1 = glm::normalize(normal_mat * base_mesh.vertex_normals[f.v[1]]);
+                    glm::vec3 wn2 = glm::normalize(normal_mat * base_mesh.vertex_normals[f.v[2]]);
+                    rasterize_triangle_phong(s0, s1, s2, z0, z1, z2, wp0, wp1, wp2, wn0, wn1, wn2,
+                                              camera.position, light, material, zbuffer);
+                }
             }
         }
 
@@ -753,6 +932,8 @@ int main() {
         if (show_axes)    draw_axes(M, VP, axis_length);
         if (show_normals) draw_normals(base_mesh, M, VP, normal_length,
                                         MFB_RGB(255, 120, 255), MFB_RGB(120, 220, 255));
+        if (show_light_debug)
+            draw_lighting_debug_vectors(base_mesh, M, VP, light, light_debug_length, 6);
 
         // ----------------------------------------------------------------
         // Assignment 1, Part 6: Interactive Line Drawing Tool.
@@ -903,6 +1084,50 @@ int main() {
             mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "-- Other --");
             mu_layout_row(ctx, 1, w, 0);
             mu_checkbox(ctx, "Show Wireframe Outline", &show_wireframe);
+            mu_end_window(ctx);
+        }
+
+        // ---- HW5: Lighting window (Assignment 5, Parts 1-4) ----
+        if (mu_begin_window(ctx, "HW5: Lighting (Phong)", mu_rect(1040, 740, 320, 440))) {
+            int w[] = {-1};
+            mu_layout_row(ctx, 1, w, 0);
+            mu_checkbox(ctx, "Enable Lighting", &lighting_enabled);
+
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "-- Shading Stage --");
+            char stage_label[64];
+            const char* stage_names[] = {"Ambient Only (Part 1)", "Flat: +Diffuse (Part 2)",
+                                          "Flat: +Specular (Part 3)", "Phong: Per-Pixel (Part 4)"};
+            snprintf(stage_label, sizeof(stage_label), "Current: %s", stage_names[lighting_stage]);
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, stage_label);
+            mu_layout_row(ctx, 1, w, 0);
+            if (mu_button(ctx, "Next Stage")) lighting_stage = (lighting_stage + 1) % 4;
+
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "-- Light Position --");
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "X:"); mu_slider(ctx, &light.position.x, -10, 10);
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "Y:"); mu_slider(ctx, &light.position.y, -10, 10);
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "Z:"); mu_slider(ctx, &light.position.z, -10, 10);
+
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "-- Light Color (Diffuse/Specular) --");
+            mu_layout_row(ctx, 1, w, 0); mu_slider(ctx, &light.diffuse.r, 0, 1);
+            mu_layout_row(ctx, 1, w, 0); mu_slider(ctx, &light.diffuse.g, 0, 1);
+            mu_layout_row(ctx, 1, w, 0); mu_slider(ctx, &light.diffuse.b, 0, 1);
+            light.specular = light.diffuse; // specular highlights match the light's color
+
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "Ambient strength:");
+            mu_layout_row(ctx, 1, w, 0); mu_slider(ctx, &light.ambient.r, 0, 0.5f);
+            light.ambient.g = light.ambient.b = light.ambient.r;
+
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "-- Material Color --");
+            mu_layout_row(ctx, 1, w, 0); mu_slider(ctx, &material.diffuse.r, 0, 1);
+            mu_layout_row(ctx, 1, w, 0); mu_slider(ctx, &material.diffuse.g, 0, 1);
+            mu_layout_row(ctx, 1, w, 0); mu_slider(ctx, &material.diffuse.b, 0, 1);
+            material.ambient = material.diffuse;
+
+            mu_layout_row(ctx, 1, w, 0); mu_label(ctx, "Shininess:");
+            mu_layout_row(ctx, 1, w, 0); mu_slider(ctx, &material.shininess, 2.0f, 128.0f);
+
+            mu_layout_row(ctx, 1, w, 0);
+            mu_checkbox(ctx, "Show Light/Reflection Vectors", &show_light_debug);
             mu_end_window(ctx);
         }
 
