@@ -66,8 +66,6 @@ To keep the repository clean and the reports professional, follow these standard
 ## Table of Contents
 | Assignment | Link |
 | :--- | :--- |
-| **Project 1: My First Project** | [View Folder](./MyFirstProject/) |
-
 | **HW1: Wireframe Engine Foundations** | [View Report](./assignments/hw1_report.md) |
 | **HW2: Mesh Loading & Transformations** | [View Report](./assignments/hw2_report.md) |
 | **HW3: Virtual Camera & Projection** | [View Report](./assignments/hw3_report.md) |
