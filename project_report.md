@@ -76,12 +76,14 @@ committed, and this project follows the same standard:
 - **Full build** — configured and compiled from a clean `build/` directory with CMake fetching
   MiniFB, MicroUI, and GLM, with zero warnings and zero errors under `-Wall -Wextra`.
 
-## Suggested report screenshots
+## What to capture (screenshots submitted separately)
 
-1. Terrain Mode off (the cube) vs. on (terrain), same camera angle.
-2. The same terrain with Procedural Coloring on vs. off.
-3. Low octave count (e.g. 1) vs. high (e.g. 7) at the same seed — smooth rolling hills vs.
-   detailed, rocky terrain.
-4. A few different seeds side by side, to show the generator produces varied results.
-5. The terrain in each of the four lighting stages (Ambient / Flat Diffuse / Flat Specular /
-   Phong per-pixel), to show the procedural color surviving through the full lighting pipeline.
+1. **Before:** the original cube, Terrain Mode off.
+2. **Terrain Mode on, wireframe visible** — showing the generated hill/valley geometry.
+3. **Same terrain, wireframe hidden** — showing the height-based procedural coloring clearly:
+   deep water/sand at the base, green grass through the middle, gray rock and white snow near
+   the peaks.
+4. **Procedural Coloring toggled off**, for comparison (falls back to the flat default look).
+
+All four were verified against the actual compiled, running program (not mockups) — the Mesh
+Info panel confirms the real vertex/face counts for the generated grid at each resolution.
