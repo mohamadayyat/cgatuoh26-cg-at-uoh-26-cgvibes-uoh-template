@@ -68,5 +68,9 @@ To keep the repository clean and the reports professional, follow these standard
 | :--- | :--- |
 | **Project 1: My First Project** | [View Folder](./MyFirstProject/) |
 
----
-*Note: Please ensure all internal links remain functional as you add new folders.*
+| **HW1: Wireframe Engine Foundations** | [View Report](./assignments/hw1_report.md) |
+| **HW2: Mesh Loading & Transformations** | [View Report](./assignments/hw2_report.md) |
+| **HW3: Virtual Camera & Projection** | [View Report](./assignments/hw3_report.md) |
+| **HW4: Rasterization & Hidden Surface Removal** | [View Report](./assignments/hw4_report.md) |
+| **HW5: Lighting & Shading (Phong)** | [View Report](./assignments/hw5_report.md) |
+| **Final Project: Procedural Terrain Generation** | [View Report](./project_report.md) |
